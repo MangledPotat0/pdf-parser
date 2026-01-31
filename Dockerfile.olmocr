@@ -18,6 +18,7 @@ RUN pip3 install --no-cache-dir \
     pillow \
     pdf2image \
     accelerate \
+    numpy \
     "numpy<2"
 
 # Copy parser script

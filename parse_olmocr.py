@@ -2,12 +2,13 @@ import os
 import base64
 from pathlib import Path
 from io import BytesIO
-from PIL import Image
+from PIL import Image, ImageDraw
 from transformers import AutoProcessor
 from transformers import Qwen2_5_VLForConditionalGeneration
 from pdf2image import convert_from_path
 import torch
 import re
+import numpy as np
 
 # Get Hugging Face token from environment
 HF_TOKEN = os.environ.get('HF_TOKEN', None)
@@ -22,13 +23,71 @@ def fix_equation_formatting(text):
     
     return text
 
+def extract_figure_from_page(pil_image, page_num, figures_dir, pdf_name):
+    """
+    Extract figure region from a page by detecting non-text areas.
+    Returns the figure path if a figure is found, None otherwise.
+    """
+    # Convert to grayscale
+    gray = pil_image.convert('L')
+    img_array = np.array(gray)
+    
+    # Simple heuristic: look for large connected regions of non-white pixels
+    # This is a basic approach - figures typically have darker pixels
+    threshold = 250  # Nearly white threshold
+    binary = img_array < threshold
+    
+    # Find bounding box of non-white regions
+    rows = np.any(binary, axis=1)
+    cols = np.any(binary, axis=0)
+    
+    if not np.any(rows) or not np.any(cols):
+        return None
+    
+    # Get the bounds
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    
+    # Calculate dimensions
+    height = rmax - rmin
+    width = cmax - cmin
+    total_pixels = height * width
+    image_pixels = img_array.shape[0] * img_array.shape[1]
+    
+    # If the non-white area is between 10% and 80% of page, likely contains a figure
+    # (Too small = just text, too large = full page text)
+    ratio = total_pixels / image_pixels
+    
+    if 0.1 < ratio < 0.8:
+        # Crop with some padding
+        padding = 20
+        crop_box = (
+            max(0, cmin - padding),
+            max(0, rmin - padding),
+            min(img_array.shape[1], cmax + padding),
+            min(img_array.shape[0], rmax + padding)
+        )
+        
+        cropped = pil_image.crop(crop_box)
+        
+        # Save the figure
+        figure_filename = f"figure_page_{page_num}.png"
+        figure_path = figures_dir / figure_filename
+        cropped.save(figure_path, "PNG")
+        
+        return f"data/{pdf_name}/{figure_filename}"
+    
+    return None
+
 def parse_pdf_with_olmocr(pdf_path, output_dir):
     """Parse PDF using olmOCR with multi-GPU support."""
     print(f"Processing: {pdf_path}")
     
-    # Create figures subdirectory
+    # Create figures subdirectory in data/[PAPER_NAME]/
     pdf_name = Path(pdf_path).stem
-    figures_dir = Path(output_dir) / f"{pdf_name}_figures"
+    # Save figures in data directory, not output
+    data_dir = Path("/app/data")
+    figures_dir = data_dir / pdf_name
     figures_dir.mkdir(exist_ok=True)
     
     # Load model with automatic device mapping across multiple GPUs
@@ -54,15 +113,9 @@ def parse_pdf_with_olmocr(pdf_path, output_dir):
     num_pages = len(images)
     print(f"Processing {num_pages} pages...")
     
-    # Save all page images as potential figures
-    print(f"Saving page images to {figures_dir}...")
-    for page_num, pil_image in enumerate(images, 1):
-        figure_path = figures_dir / f"page_{page_num}.png"
-        pil_image.save(figure_path, "PNG")
-    
     # Process each page
     markdown_pages = []
-    figure_references = []
+    extracted_figures = {}  # page_num -> figure_path
     
     for page_num, pil_image in enumerate(images, 1):
         print(f"Processing page {page_num}/{num_pages}...")
@@ -74,7 +127,7 @@ def parse_pdf_with_olmocr(pdf_path, output_dir):
                 "content": [
                     {
                         "type": "text",
-                        "text": "Extract all text from this image in markdown format. Preserve the structure, headings, equations (in LaTeX), and tables. For figures/diagrams, note their location with markdown image syntax: ![Figure caption](path). For tables, use markdown table syntax."
+                        "text": "Extract all text from this image in markdown format. Preserve the structure, headings, equations (in LaTeX), and tables. If there are figures or diagrams, describe them briefly with 'Figure N: [description]'. For tables, use markdown table syntax."
                     },
                     {
                         "type": "image",
@@ -120,12 +173,21 @@ def parse_pdf_with_olmocr(pdf_path, output_dir):
             skip_special_tokens=True
         )[0]
         
-        # Check if page contains figure references
+        # Check if page contains figure references and extract the figure
         if re.search(r'Figure \d+:', text_output, re.IGNORECASE):
-            figure_references.append((page_num, text_output))
-            # Add reference to saved page image
-            figure_path = f"{pdf_name}_figures/page_{page_num}.png"
-            text_output += f"\n\n![Page {page_num} - Contains figure]({figure_path})\n"
+            print(f"  -> Figure detected on page {page_num}, extracting...")
+            figure_path = extract_figure_from_page(pil_image, page_num, figures_dir, pdf_name)
+            if figure_path:
+                extracted_figures[page_num] = figure_path
+                # Add figure reference in markdown
+                text_output += f"\n\n![Figure from page {page_num}]({figure_path})\n"
+                print(f"  -> Figure saved to: {figure_path}")
+            else:
+                # Save full page as fallback
+                fallback_path = f"data/{pdf_name}/page_{page_num}.png"
+                pil_image.save(figures_dir / f"page_{page_num}.png", "PNG")
+                text_output += f"\n\n![Page {page_num}]({fallback_path})\n"
+                print(f"  -> Saved full page as fallback")
         
         markdown_pages.append(text_output)
         print(f"Page {page_num} done ({len(text_output)} chars)")
@@ -146,12 +208,12 @@ def parse_pdf_with_olmocr(pdf_path, output_dir):
     print(f"\nSaved markdown to: {output_path}")
     
     # Print figure summary
-    if figure_references:
-        print(f"\nFound {len(figure_references)} pages with figures:")
-        for page_num, _ in figure_references:
-            print(f"  - Page {page_num}: {figures_dir}/page_{page_num}.png")
+    if extracted_figures:
+        print(f"\n✓ Extracted {len(extracted_figures)} figures:")
+        for page_num, fig_path in extracted_figures.items():
+            print(f"  - Page {page_num}: {fig_path}")
     
-    print(f"All page images saved to: {figures_dir}/")
+    print(f"\nFigures saved to: {figures_dir}/")
     
     return output_path
 
