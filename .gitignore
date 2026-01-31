@@ -2,6 +2,9 @@
 data/
 output/
 
+# Environment variables (contains sensitive tokens)
+.env
+
 # Python
 __pycache__/
 *.py[cod]
