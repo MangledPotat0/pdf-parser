@@ -12,9 +12,24 @@ import re
 # Get Hugging Face token from environment
 HF_TOKEN = os.environ.get('HF_TOKEN', None)
 
+def fix_equation_formatting(text):
+    """Convert LaTeX equations from \[ \] and \( \) to $$ $$ and $ $ for markdown."""
+    # Replace block equations: \[ ... \] -> $$ ... $$
+    text = re.sub(r'\\\[(.*?)\\\]', r'$$\1$$', text, flags=re.DOTALL)
+    
+    # Replace inline equations: \( ... \) -> $ ... $
+    text = re.sub(r'\\\((.*?)\\\)', r'$\1$', text, flags=re.DOTALL)
+    
+    return text
+
 def parse_pdf_with_olmocr(pdf_path, output_dir):
     """Parse PDF using olmOCR with multi-GPU support."""
     print(f"Processing: {pdf_path}")
+    
+    # Create figures subdirectory
+    pdf_name = Path(pdf_path).stem
+    figures_dir = Path(output_dir) / f"{pdf_name}_figures"
+    figures_dir.mkdir(exist_ok=True)
     
     # Load model with automatic device mapping across multiple GPUs
     print("Loading olmOCR model with multi-GPU support...")
@@ -39,19 +54,27 @@ def parse_pdf_with_olmocr(pdf_path, output_dir):
     num_pages = len(images)
     print(f"Processing {num_pages} pages...")
     
+    # Save all page images as potential figures
+    print(f"Saving page images to {figures_dir}...")
+    for page_num, pil_image in enumerate(images, 1):
+        figure_path = figures_dir / f"page_{page_num}.png"
+        pil_image.save(figure_path, "PNG")
+    
     # Process each page
     markdown_pages = []
+    figure_references = []
+    
     for page_num, pil_image in enumerate(images, 1):
         print(f"Processing page {page_num}/{num_pages}...")
         
-        # Simple prompt for OCR
+        # Enhanced prompt to detect figures
         messages = [
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": "Extract all text from this image in markdown format. Preserve the structure, headings, equations (in LaTeX), and tables."
+                        "text": "Extract all text from this image in markdown format. Preserve the structure, headings, equations (in LaTeX), and tables. For figures/diagrams, note their location with markdown image syntax: ![Figure caption](path). For tables, use markdown table syntax."
                     },
                     {
                         "type": "image",
@@ -97,20 +120,38 @@ def parse_pdf_with_olmocr(pdf_path, output_dir):
             skip_special_tokens=True
         )[0]
         
+        # Check if page contains figure references
+        if re.search(r'Figure \d+:', text_output, re.IGNORECASE):
+            figure_references.append((page_num, text_output))
+            # Add reference to saved page image
+            figure_path = f"{pdf_name}_figures/page_{page_num}.png"
+            text_output += f"\n\n![Page {page_num} - Contains figure]({figure_path})\n"
+        
         markdown_pages.append(text_output)
         print(f"Page {page_num} done ({len(text_output)} chars)")
     
     # Combine all pages
     full_markdown = "\n\n---\n\n".join(markdown_pages)
     
+    # Fix equation formatting for proper markdown rendering
+    print("Converting LaTeX equation syntax...")
+    full_markdown = fix_equation_formatting(full_markdown)
+    
     # Use PDF filename for output
-    pdf_name = Path(pdf_path).stem
     output_filename = f"{pdf_name}_olmocr.md"
     
     # Save output
     output_path = Path(output_dir) / output_filename
     output_path.write_text(full_markdown, encoding='utf-8')
-    print(f"\nSaved to: {output_path}")
+    print(f"\nSaved markdown to: {output_path}")
+    
+    # Print figure summary
+    if figure_references:
+        print(f"\nFound {len(figure_references)} pages with figures:")
+        for page_num, _ in figure_references:
+            print(f"  - Page {page_num}: {figures_dir}/page_{page_num}.png")
+    
+    print(f"All page images saved to: {figures_dir}/")
     
     return output_path
 
